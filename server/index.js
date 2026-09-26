@@ -1707,6 +1707,182 @@ app.post('/api/suggestions/:suggestionId/adopt', (req, res) => {
   res.json({ ok: true });
 });
 
+/* ----------------------------- 道具借还 ----------------------------- */
+
+function getPropOr404(propId) {
+  const prop = db.prepare('SELECT * FROM props WHERE id = ?').get(Number(propId));
+  if (!prop) {
+    const e = new Error('道具不存在');
+    e.status = 404;
+    throw e;
+  }
+  return prop;
+}
+
+/**
+ * 道具台账列表（本机全剧目共用）：每种道具给出总量、全部剧本未归还合计、
+ * 可借量（= 总量 − 全部未归还数量）与台账版本（乐观锁），并附全部借用记录
+ * （含各剧本尚未归还的记录；已还清的记录同样返回——全部归还后记录保留）。
+ */
+app.get('/api/props', (req, res) => {
+  const props = db.prepare('SELECT * FROM props ORDER BY name, id').all();
+  const loans = db
+    .prepare(
+      `SELECT l.*, s.title AS script_title
+       FROM prop_loans l JOIN scripts s ON s.id = l.script_id
+       ORDER BY l.id`
+    )
+    .all();
+  const loansByProp = new Map();
+  for (const l of loans) {
+    if (!loansByProp.has(l.prop_id)) loansByProp.set(l.prop_id, []);
+    loansByProp.get(l.prop_id).push({
+      id: l.id,
+      script_id: l.script_id,
+      script_title: l.script_title,
+      borrower: l.borrower,
+      quantity: l.quantity,
+      returned: l.returned,
+      outstanding: l.quantity - l.returned,
+      created_at: l.created_at,
+      updated_at: l.updated_at,
+    });
+  }
+  res.json(
+    props.map((p) => {
+      const list = loansByProp.get(p.id) || [];
+      const borrowed = list.reduce((n, l) => n + l.outstanding, 0);
+      return {
+        id: p.id,
+        name: p.name,
+        total: p.total,
+        version: p.version,
+        borrowed,
+        available: p.total - borrowed,
+        loans: list,
+        created_at: p.created_at,
+      };
+    })
+  );
+});
+
+// 登记道具：名称唯一（全剧目共用一份台账），总量为正整数
+app.post('/api/props', (req, res) => {
+  const name = String(req.body.name || '').trim();
+  const total = Number(req.body.total);
+  if (!name) return res.status(400).json({ error: '道具名称不能为空' });
+  if (!Number.isInteger(total) || total <= 0) {
+    return res.status(400).json({ error: '道具总量必须为正整数' });
+  }
+  try {
+    const info = db.prepare('INSERT INTO props (name, total) VALUES (?, ?)').run(name, total);
+    res.status(201).json({ id: info.lastInsertRowid });
+  } catch (err) {
+    if (String(err.message).includes('UNIQUE')) {
+      return res
+        .status(409)
+        .json({ error: `道具「${name}」已登记过，请直接在既有台账下借还`, conflict: true });
+    }
+    throw err;
+  }
+});
+
+/**
+ * 借出：在指定剧本（页面当前打开的剧本）下登记领用人与正整数数量。
+ * 请求必须携带页面读取的台账版本 expectedVersion；同一事务内：
+ * 校验版本（过期 409）→ 校验可借量（超额借出 409）→ 写入借用记录并递增版本。
+ * 任一校验失败整笔回滚，台账不变。
+ */
+app.post('/api/props/:id/borrow', (req, res) => {
+  const prop = getPropOr404(req.params.id);
+  const scriptId = Number(req.body.scriptId);
+  const borrower = String(req.body.borrower || '').trim();
+  const quantity = Number(req.body.quantity);
+  const expectedVersion = Number(req.body.expectedVersion);
+  if (!Number.isInteger(scriptId) || scriptId <= 0) {
+    return res.status(400).json({ error: '缺少借出所属剧本 scriptId' });
+  }
+  getScriptOr404(scriptId);
+  if (!borrower) return res.status(400).json({ error: '请填写领用人' });
+  if (!Number.isInteger(quantity) || quantity <= 0) {
+    return res.status(400).json({ error: '借出数量必须为正整数' });
+  }
+  if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
+    return res.status(400).json({ error: '缺少道具库存版本 expectedVersion' });
+  }
+
+  const outcome = db.transaction(() => {
+    // 事务内重新读取台账，避免并发下基于过期版本借出
+    const cur = db.prepare('SELECT * FROM props WHERE id = ?').get(prop.id);
+    if (cur.version !== expectedVersion) {
+      throw conflict('道具库存已变化（版本过期），请刷新后重试');
+    }
+    const borrowed = db
+      .prepare(
+        'SELECT COALESCE(SUM(quantity - returned), 0) AS n FROM prop_loans WHERE prop_id = ?'
+      )
+      .get(prop.id).n;
+    const available = cur.total - borrowed;
+    if (quantity > available) {
+      throw conflict(`借出数量超过可借量（当前可借 ${available} 件），请刷新后重试`);
+    }
+    const info = db
+      .prepare(
+        'INSERT INTO prop_loans (prop_id, script_id, borrower, quantity) VALUES (?, ?, ?, ?)'
+      )
+      .run(prop.id, scriptId, borrower, quantity);
+    db.prepare(
+      "UPDATE props SET version = version + 1, updated_at = datetime('now') WHERE id = ?"
+    ).run(prop.id);
+    return { loanId: info.lastInsertRowid, version: cur.version + 1 };
+  })();
+
+  res.status(201).json({ ok: true, ...outcome });
+});
+
+/**
+ * 归还：按所选借用记录分批抵扣（只抵扣该记录，不影响同道具的其他记录），
+ * 数量为正整数且不得超过该记录的未归还数量（超额归还 409）。
+ * 同样携带台账版本 expectedVersion，同一事务内校验版本与数量、累计归还并递增版本；
+ * 全部归还后记录保留（returned = quantity），不会删除。
+ */
+app.post('/api/loans/:loanId/return', (req, res) => {
+  const loan = db
+    .prepare('SELECT * FROM prop_loans WHERE id = ?')
+    .get(Number(req.params.loanId));
+  if (!loan) return res.status(404).json({ error: '借用记录不存在' });
+  const quantity = Number(req.body.quantity);
+  const expectedVersion = Number(req.body.expectedVersion);
+  if (!Number.isInteger(quantity) || quantity <= 0) {
+    return res.status(400).json({ error: '归还数量必须为正整数' });
+  }
+  if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
+    return res.status(400).json({ error: '缺少道具库存版本 expectedVersion' });
+  }
+
+  const outcome = db.transaction(() => {
+    // 事务内重新读取记录与台账，避免并发下基于过期版本归还
+    const curLoan = db.prepare('SELECT * FROM prop_loans WHERE id = ?').get(loan.id);
+    const cur = db.prepare('SELECT * FROM props WHERE id = ?').get(curLoan.prop_id);
+    if (cur.version !== expectedVersion) {
+      throw conflict('道具库存已变化（版本过期），请刷新后重试');
+    }
+    const outstanding = curLoan.quantity - curLoan.returned;
+    if (quantity > outstanding) {
+      throw conflict(`归还数量超过该记录未归还数量（未还 ${outstanding} 件），请刷新后重试`);
+    }
+    db.prepare(
+      "UPDATE prop_loans SET returned = returned + ?, updated_at = datetime('now') WHERE id = ?"
+    ).run(quantity, curLoan.id);
+    db.prepare(
+      "UPDATE props SET version = version + 1, updated_at = datetime('now') WHERE id = ?"
+    ).run(cur.id);
+    return { version: cur.version + 1, returned: curLoan.returned + quantity };
+  })();
+
+  res.json({ ok: true, ...outcome });
+});
+
 /* ----------------------------- 错误处理 ----------------------------- */
 
 app.use((err, req, res, next) => {

@@ -889,3 +889,63 @@ body {
 .run-item-asset { width: 100%; padding-left: 44px; margin-top: 0; }
 .run-log-asset { width: 100%; padding-left: 0; margin-top: 2px; }
 .makeup-item-asset { width: 100%; padding-left: 26px; margin-top: 2px; }
+
+/* ---------------- 道具借还 ---------------- */
+.prop-register-box {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  background: var(--bg);
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 14px;
+}
+.prop-register-box .input { margin-bottom: 0; flex: 1; min-width: 150px; }
+.prop-register-box .prop-qty { flex: 0 0 140px; min-width: 0; }
+.prop-register-box .btn { white-space: nowrap; }
+
+.prop-list { display: flex; flex-direction: column; gap: 10px; }
+.prop-item {
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+.prop-item-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.prop-name { font-weight: 700; font-size: 15px; }
+.prop-stats { color: var(--text-dim); font-size: 13px; }
+.prop-stats strong { color: var(--text); }
+.prop-stats .sep { margin: 0 6px; }
+.prop-ok { color: var(--ok) !important; }
+.prop-warn { color: var(--light-cue) !important; }
+.prop-version { margin-left: auto; color: var(--text-dim); font-size: 12px; }
+
+.prop-borrow-form { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.prop-borrow-form .input { margin-bottom: 0; flex: 1; min-width: 130px; }
+.prop-borrow-form .prop-qty { flex: 0 0 110px; min-width: 0; }
+.prop-borrow-form .btn { white-space: nowrap; }
+
+.prop-loan-head { margin: 12px 0 6px; font-size: 13px; font-weight: 600; color: var(--text-dim); }
+.prop-returned-head { color: var(--ok); font-weight: 400; }
+.prop-loan-list { display: flex; flex-direction: column; gap: 6px; }
+.prop-loan {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--light-cue);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 13.5px;
+  flex-wrap: wrap;
+}
+.prop-loan.is-returned { border-left-color: var(--ok); opacity: 0.75; }
+.prop-loan-info { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
+.prop-loan-script { color: var(--text-dim); }
+.prop-loan-time { color: var(--text-dim); font-size: 12px; }
+.prop-loan-return { display: flex; gap: 8px; align-items: center; }
+.prop-loan-return .prop-qty { width: 92px; margin-bottom: 0; flex: none; }

@@ -200,6 +200,37 @@ CREATE TABLE IF NOT EXISTS session_makeup_sources (
 
 CREATE INDEX IF NOT EXISTS idx_makeup_sources_session ON session_makeup_sources(session_id);
 CREATE INDEX IF NOT EXISTS idx_makeup_sources_source ON session_makeup_sources(source_session_id);
+
+-- 道具库存台账：本机全剧目共用。name 唯一；total 为正整数总量；
+-- version 为台账版本（乐观锁）：每次借出/归还在同一事务内 +1，
+-- 借还请求必须携带页面读取到的版本，不一致即 409 且台账不变。
+CREATE TABLE IF NOT EXISTS props (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT    NOT NULL UNIQUE,
+  total      INTEGER NOT NULL CHECK (total > 0),
+  version    INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 道具借用记录：挂在借出时打开的剧本下（剧本删除时级联清除，其占用库存随之释放）。
+-- quantity 为正整数借出数量；returned 为累计已归还数量（分批归还、只增不减），
+-- returned = quantity 即全部归还，记录本身保留不删除；未归还数量 = quantity - returned。
+-- 某种道具的可借量 = total − 该道具全部记录未归还数量合计。
+CREATE TABLE IF NOT EXISTS prop_loans (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  prop_id    INTEGER NOT NULL REFERENCES props(id),
+  script_id  INTEGER NOT NULL REFERENCES scripts(id) ON DELETE CASCADE,
+  borrower   TEXT    NOT NULL,
+  quantity   INTEGER NOT NULL CHECK (quantity > 0),
+  returned   INTEGER NOT NULL DEFAULT 0 CHECK (returned >= 0),
+  created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
+  CHECK (returned <= quantity)
+);
+
+CREATE INDEX IF NOT EXISTS idx_prop_loans_prop ON prop_loans(prop_id);
+CREATE INDEX IF NOT EXISTS idx_prop_loans_script ON prop_loans(script_id);
 `);
 
 // 兼容旧库：早期版本的 session_executions 没有 kind / miss_reason 列。

@@ -50,6 +50,7 @@
       <button class="tab-btn" id="tabRunBtn">🗂️ 排练执行台</button>
       <button class="tab-btn" id="tabVersionsBtn">🕘 版本回溯</button>
       <button class="tab-btn" id="tabAssetsBtn">🔊 音效素材库</button>
+      <button class="tab-btn" id="tabPropsBtn">🧰 道具借还</button>
     </div>
 
     <div id="cueTab">
@@ -146,6 +147,24 @@
           <span class="hint" id="assetUploadHint">支持 MP3 / WAV / OGG，单个文件不超过 10 MB</span>
         </div>
         <div id="assetList" class="asset-list"></div>
+      </section>
+    </div>
+
+    <!-- 道具借还 -->
+    <div id="propsTab" class="hidden">
+      <section class="panel">
+        <div class="panel-head">
+          <h3>🧰 道具借还</h3>
+          <span class="hint">
+            道具库存为本机全剧目共用：借出登记在当前打开的剧本下；归还按借用记录分批抵扣，全部归还后记录保留。可借量 = 总量 − 全部未归还数量
+          </span>
+        </div>
+        <div class="prop-register-box">
+          <input id="propName" class="input" type="text" placeholder="道具名称，如：长剑、折扇" />
+          <input id="propTotal" class="input prop-qty" type="number" min="1" step="1" placeholder="总量（正整数）" />
+          <button class="btn btn-primary" id="propRegisterBtn">登记道具</button>
+        </div>
+        <div id="propList" class="prop-list"></div>
       </section>
     </div>
 

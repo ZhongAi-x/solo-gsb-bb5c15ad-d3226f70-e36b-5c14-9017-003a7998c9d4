@@ -4,7 +4,7 @@
 
 const state = {
   view: 'list', // 'list' | 'detail'
-  tab: 'cue', // 'cue' | 'run'
+  tab: 'cue', // 'cue' | 'run' | 'versions' | 'assets' | 'props'
   mode: 'view', // 'view' | 'edit'
   script: null, // 当前剧本详情 { id, title, content, current_version, cues }
   cueModal: null, // { mode:'add', lineNo } | { mode:'edit', cue }
@@ -29,6 +29,10 @@ const state = {
   assets: {
     list: [], // 音效素材库（本机全剧目共用）
     loaded: false, // 是否已拉取；提示增删改后失效需重新拉取（引用计数会变化）
+  },
+  props: {
+    list: [], // 道具台账（本机全剧目共用，含各剧本借用记录与台账版本）
+    loaded: false,
   },
 };
 
@@ -500,6 +504,16 @@ document.addEventListener('click', async (e) => {
   // 删除素材：被引用时服务端返回 409 冲突，展示引用明细
   if (action === 'delete-asset') {
     await deleteAsset(btn);
+    return;
+  }
+
+  // 道具借还：借出（登记到本剧本）/ 按所选借用记录归还
+  if (action === 'prop-borrow') {
+    await borrowProp(Number(btn.dataset.prop));
+    return;
+  }
+  if (action === 'prop-return') {
+    await returnProp(Number(btn.dataset.loan), Number(btn.dataset.prop));
     return;
   }
 
@@ -1010,6 +1024,190 @@ async function deleteAsset(btn) {
   }
 }
 
+/* =============================== 道具借还 =============================== */
+
+async function loadPropsTab() {
+  try {
+    state.props.list = await api('GET', '/api/props');
+    state.props.loaded = true;
+    renderProps();
+  } catch (err) {
+    $('propList').innerHTML = `<div class="empty">${escapeHtml(err.message)}</div>`;
+  }
+}
+
+/**
+ * 道具台账渲染：每种道具展示总量 / 未归还合计 / 可借量与台账版本；
+ * 借出表单登记到当前剧本；各剧本尚未归还的记录（当前剧本排前）逐条带归还表单，
+ * 已还清的记录保留在「已归还记录」区（只读）。
+ */
+function renderProps() {
+  const box = $('propList');
+  const list = state.props.list;
+  if (!list.length) {
+    box.innerHTML =
+      '<div class="empty">道具库为空。先在上方登记道具名称与总量，之后即可在本剧本下借出。</div>';
+    return;
+  }
+  const curId = state.script.id;
+  const loanInfo = (l) => `
+    <div class="prop-loan-info">
+      <span class="prop-loan-script">
+        ${l.script_id === curId ? '<span class="badge badge-version">本剧本</span>' : ''}《${escapeHtml(l.script_title)}》
+      </span>
+      <span>领用人 <strong>${escapeHtml(l.borrower)}</strong></span>
+      <span>借出 ${l.quantity} · 已还 ${l.returned}${
+        l.outstanding > 0 ? ` · <strong class="prop-warn">未还 ${l.outstanding}</strong>` : ' · 已全部归还'
+      }</span>
+      <span class="prop-loan-time">借出于 ${escapeHtml(l.created_at)}</span>
+    </div>`;
+  box.innerHTML = list
+    .map((p) => {
+      const outstanding = p.loans
+        .filter((l) => l.outstanding > 0)
+        .sort((a, b) => {
+          // 当前剧本的未归还记录排在前面，其余按记录先后排列
+          const ac = a.script_id === curId ? 0 : 1;
+          const bc = b.script_id === curId ? 0 : 1;
+          return ac - bc || a.id - b.id;
+        });
+      const returned = p.loans.filter((l) => l.outstanding === 0);
+      return `
+      <div class="prop-item">
+        <div class="prop-item-head">
+          <span class="prop-name">🧰 ${escapeHtml(p.name)}</span>
+          <span class="prop-stats">
+            总量 <strong>${p.total}</strong><span class="sep">·</span>
+            未归还 <strong class="${p.borrowed ? 'prop-warn' : ''}">${p.borrowed}</strong><span class="sep">·</span>
+            可借 <strong class="${p.available > 0 ? 'prop-ok' : 'prop-warn'}">${p.available}</strong>
+          </span>
+          <span class="prop-version">台账版本 v${p.version}</span>
+        </div>
+        <div class="prop-borrow-form">
+          <input id="propBorrower-${p.id}" class="input" type="text" placeholder="领用人" />
+          <input id="propBorrowQty-${p.id}" class="input prop-qty" type="number" min="1" step="1" placeholder="数量" />
+          <button class="btn btn-sm btn-primary" data-action="prop-borrow" data-prop="${p.id}"
+                  ${p.available <= 0 ? 'disabled' : ''}>借出到本剧本</button>
+        </div>
+        ${
+          outstanding.length
+            ? `<div class="prop-loan-head">尚未归还（${outstanding.length} 条记录 · 共 ${p.borrowed} 件）</div>
+               <div class="prop-loan-list">
+                ${outstanding
+                  .map(
+                    (l) => `
+                  <div class="prop-loan">
+                    ${loanInfo(l)}
+                    <div class="prop-loan-return">
+                      <input id="propReturnQty-${l.id}" class="input prop-qty" type="number"
+                             min="1" max="${l.outstanding}" step="1" value="${l.outstanding}" />
+                      <button class="btn btn-sm" data-action="prop-return"
+                              data-loan="${l.id}" data-prop="${p.id}">归还</button>
+                    </div>
+                  </div>`
+                  )
+                  .join('')}
+               </div>`
+            : '<div class="hint" style="margin:8px 0 0">当前没有未归还记录。</div>'
+        }
+        ${
+          returned.length
+            ? `<div class="prop-loan-head prop-returned-head">已归还记录（台账保留，${returned.length} 条）</div>
+               <div class="prop-loan-list">
+                ${returned
+                  .map(
+                    (l) => `
+                  <div class="prop-loan is-returned">${loanInfo(l)}</div>`
+                  )
+                  .join('')}
+               </div>`
+            : ''
+        }
+      </div>`;
+    })
+    .join('');
+}
+
+$('propRegisterBtn').addEventListener('click', async () => {
+  const name = $('propName').value.trim();
+  const total = Number($('propTotal').value);
+  if (!name) return toast('请填写道具名称', true);
+  if (!Number.isInteger(total) || total <= 0) return toast('道具总量必须为正整数', true);
+  const btn = $('propRegisterBtn');
+  btn.disabled = true;
+  try {
+    await api('POST', '/api/props', { name, total });
+    $('propName').value = '';
+    $('propTotal').value = '';
+    toast(`道具「${name}」已登记（全剧目共用）`);
+    await loadPropsTab();
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+/** 道具借还 409（版本过期 / 超额借出 / 超额归还）：刷新台账为最新数据，提示重新操作 */
+function handlePropConflict(err) {
+  if (err.status === 409) {
+    toast(`冲突：${err.message}`, true);
+    loadPropsTab(); // 台账已变化，刷新为最新数据后再操作
+  } else {
+    toast(err.message, true);
+  }
+}
+
+/** 借出：登记到当前剧本，携带页面读取的台账版本做乐观锁校验 */
+async function borrowProp(propId) {
+  const p = state.props.list.find((x) => x.id === propId);
+  if (!p) return toast('道具台账已变化，请刷新', true);
+  const borrower = $(`propBorrower-${propId}`).value.trim();
+  const quantity = Number($(`propBorrowQty-${propId}`).value);
+  if (!borrower) return toast('请填写领用人', true);
+  if (!Number.isInteger(quantity) || quantity <= 0) {
+    return toast('借出数量必须为正整数', true);
+  }
+  try {
+    await api('POST', `/api/props/${propId}/borrow`, {
+      scriptId: state.script.id,
+      borrower,
+      quantity,
+      expectedVersion: p.version,
+    });
+    toast(`已借出 ${quantity} 件「${p.name}」给 ${borrower}（登记在本剧本下）`);
+    await loadPropsTab();
+  } catch (err) {
+    handlePropConflict(err);
+  }
+}
+
+/** 归还：只抵扣所选借用记录，携带页面读取的台账版本做乐观锁校验 */
+async function returnProp(loanId, propId) {
+  const p = state.props.list.find((x) => x.id === propId);
+  if (!p) return toast('道具台账已变化，请刷新', true);
+  const loan = p.loans.find((l) => l.id === loanId);
+  if (!loan) return toast('借用记录已不存在，请刷新', true);
+  const quantity = Number($(`propReturnQty-${loanId}`).value);
+  if (!Number.isInteger(quantity) || quantity <= 0) {
+    return toast('归还数量必须为正整数', true);
+  }
+  try {
+    await api('POST', `/api/loans/${loanId}/return`, {
+      quantity,
+      expectedVersion: p.version,
+    });
+    toast(
+      quantity >= loan.outstanding
+        ? `「${p.name}」该记录已全部归还（记录保留在台账中）`
+        : `已归还 ${quantity} 件「${p.name}」，该记录还剩 ${loan.outstanding - quantity} 件未还`
+    );
+    await loadPropsTab();
+  } catch (err) {
+    handlePropConflict(err);
+  }
+}
+
 /* =============================== 标签页切换 =============================== */
 
 function switchTab(tab) {
@@ -1019,19 +1217,23 @@ function switchTab(tab) {
   $('runTab').classList.toggle('hidden', tab !== 'run');
   $('versionsTab').classList.toggle('hidden', tab !== 'versions');
   $('assetsTab').classList.toggle('hidden', tab !== 'assets');
+  $('propsTab').classList.toggle('hidden', tab !== 'props');
   $('tabCueBtn').classList.toggle('active', tab === 'cue');
   $('tabRunBtn').classList.toggle('active', tab === 'run');
   $('tabVersionsBtn').classList.toggle('active', tab === 'versions');
   $('tabAssetsBtn').classList.toggle('active', tab === 'assets');
+  $('tabPropsBtn').classList.toggle('active', tab === 'props');
   if (tab === 'run') loadRunTab();
   if (tab === 'versions') loadVersionsTab();
   if (tab === 'assets') loadAssetsTab();
+  if (tab === 'props') loadPropsTab();
 }
 
 $('tabCueBtn').addEventListener('click', () => switchTab('cue'));
 $('tabRunBtn').addEventListener('click', () => switchTab('run'));
 $('tabVersionsBtn').addEventListener('click', () => switchTab('versions'));
 $('tabAssetsBtn').addEventListener('click', () => switchTab('assets'));
+$('tabPropsBtn').addEventListener('click', () => switchTab('props'));
 
 /* =============================== 排练执行台 =============================== */
 
