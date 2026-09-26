@@ -652,6 +652,183 @@ app.delete('/api/assets/:id', (req, res) => {
   res.json({ ok: true });
 });
 
+/* ----------------------------- 道具借还（库存跨剧本共用） ----------------------------- */
+
+/** 道具当前全部未归还数量（跨全部剧本求和；可借量 = 总量 − 该值） */
+function propOutstanding(propId) {
+  return db
+    .prepare(
+      'SELECT COALESCE(SUM(quantity - returned), 0) AS n FROM prop_loans WHERE prop_id = ?'
+    )
+    .get(propId).n;
+}
+
+/**
+ * 道具库存序列化：总量、可借量（= 总量 − 全部未归还数量）、库存版本，
+ * 以及全部借用记录（按剧本标注领用人/数量/已还/未还；全部归还的记录保留在台账中）。
+ */
+function serializeProp(p) {
+  const loans = db
+    .prepare(
+      `SELECT l.*, s.title AS script_title
+       FROM prop_loans l JOIN scripts s ON s.id = l.script_id
+       WHERE l.prop_id = ?
+       ORDER BY l.id`
+    )
+    .all(p.id)
+    .map((l) => ({
+      id: l.id,
+      script_id: l.script_id,
+      script_title: l.script_title,
+      borrower: l.borrower,
+      quantity: l.quantity,
+      returned: l.returned,
+      outstanding: l.quantity - l.returned,
+      created_at: l.created_at,
+      updated_at: l.updated_at,
+    }));
+  const borrowed = loans.reduce((sum, l) => sum + l.outstanding, 0);
+  return {
+    id: p.id,
+    name: p.name,
+    total: p.total,
+    version: p.version,
+    borrowed, // 全部剧本未归还数量合计
+    available: p.total - borrowed, // 可借量
+    created_at: p.created_at,
+    loans,
+  };
+}
+
+function getPropOr404(propId) {
+  const prop = db.prepare('SELECT * FROM props WHERE id = ?').get(Number(propId));
+  if (!prop) {
+    const e = new Error('道具不存在');
+    e.status = 404;
+    throw e;
+  }
+  return prop;
+}
+
+// 道具库存列表（全剧目共用）：总量、可借量、库存版本与各剧本借用记录（含已归还完毕的历史）
+app.get('/api/props', (req, res) => {
+  const rows = db.prepare('SELECT * FROM props ORDER BY id').all();
+  res.json(rows.map(serializeProp));
+});
+
+// 登记道具：名称唯一，总量为正整数
+app.post('/api/props', (req, res) => {
+  const name = String(req.body.name || '').trim();
+  const total = Number(req.body.total);
+  if (!name) return res.status(400).json({ error: '道具名称不能为空' });
+  if (!Number.isInteger(total) || total <= 0) {
+    return res.status(400).json({ error: '道具总量必须为正整数' });
+  }
+  try {
+    const info = db.prepare('INSERT INTO props (name, total) VALUES (?, ?)').run(name, total);
+    const prop = db.prepare('SELECT * FROM props WHERE id = ?').get(info.lastInsertRowid);
+    res.status(201).json(serializeProp(prop));
+  } catch (err) {
+    if (String(err.message).includes('UNIQUE')) {
+      return res
+        .status(409)
+        .json({ error: `道具「${name}」已登记过，请直接在库存列表中借还`, conflict: true });
+    }
+    throw err;
+  }
+});
+
+/**
+ * 借出：在指定剧本下登记领用人与正整数数量。
+ * 请求必须携带页面读取的库存版本 expectedVersion；同一事务内——
+ * 复核库存版本（过期 409）→ 复核可借量（超额借出 409）→ 写入借用记录并递增版本。
+ * 任一校验失败整笔回滚，台账不变。
+ */
+app.post('/api/props/:id/borrow', (req, res) => {
+  const propId = Number(req.params.id);
+  const scriptId = Number(req.body.scriptId);
+  const borrower = String(req.body.borrower || '').trim();
+  const quantity = Number(req.body.quantity);
+  const expectedVersion = Number(req.body.expectedVersion);
+  if (!Number.isInteger(scriptId) || scriptId <= 0) {
+    return res.status(400).json({ error: '缺少借出所属的剧本' });
+  }
+  if (!borrower) return res.status(400).json({ error: '请填写领用人' });
+  if (!Number.isInteger(quantity) || quantity <= 0) {
+    return res.status(400).json({ error: '借出数量必须为正整数' });
+  }
+  if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
+    return res.status(400).json({ error: '缺少道具库存版本 expectedVersion' });
+  }
+
+  const prop = db.transaction(() => {
+    const cur = getPropOr404(propId);
+    getScriptOr404(scriptId);
+    if (cur.version !== expectedVersion) {
+      throw conflict('道具库存已变化（版本过期），请刷新后重试');
+    }
+    const available = cur.total - propOutstanding(cur.id);
+    if (quantity > available) {
+      throw conflict(
+        `超额借出：「${cur.name}」当前可借 ${available} 件，本次申请 ${quantity} 件，请刷新后重试`
+      );
+    }
+    db.prepare(
+      'INSERT INTO prop_loans (prop_id, script_id, borrower, quantity) VALUES (?, ?, ?, ?)'
+    ).run(cur.id, scriptId, borrower, quantity);
+    db.prepare('UPDATE props SET version = version + 1 WHERE id = ?').run(cur.id);
+    return db.prepare('SELECT * FROM props WHERE id = ?').get(cur.id);
+  })();
+
+  res.status(201).json(serializeProp(prop));
+});
+
+/**
+ * 归还：只能抵扣所选借用记录（按记录分批归还）。
+ * 同样必须携带页面读取的库存版本；同一事务内复核版本与该记录未还数量——
+ * 超额归还或版本过期一律 409 且不改变台账；全部归还后记录保留（returned = quantity）。
+ */
+app.post('/api/loans/:loanId/return', (req, res) => {
+  const loanId = Number(req.params.loanId);
+  const quantity = Number(req.body.quantity);
+  const expectedVersion = Number(req.body.expectedVersion);
+  if (!Number.isInteger(quantity) || quantity <= 0) {
+    return res.status(400).json({ error: '归还数量必须为正整数' });
+  }
+  if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
+    return res.status(400).json({ error: '缺少道具库存版本 expectedVersion' });
+  }
+
+  const prop = db.transaction(() => {
+    const loan = db.prepare('SELECT * FROM prop_loans WHERE id = ?').get(loanId);
+    if (!loan) {
+      const e = new Error('借用记录不存在');
+      e.status = 404;
+      throw e;
+    }
+    const cur = getPropOr404(loan.prop_id);
+    if (cur.version !== expectedVersion) {
+      throw conflict('道具库存已变化（版本过期），请刷新后重试');
+    }
+    const outstanding = loan.quantity - loan.returned;
+    if (outstanding <= 0) {
+      throw conflict('该借用记录已全部归还，请刷新后查看');
+    }
+    if (quantity > outstanding) {
+      throw conflict(
+        `超额归还：该记录尚未归还 ${outstanding} 件，本次申请 ${quantity} 件，请刷新后重试`
+      );
+    }
+    db.prepare(
+      "UPDATE prop_loans SET returned = returned + ?, updated_at = datetime('now') WHERE id = ?"
+    ).run(quantity, loan.id);
+    db.prepare('UPDATE props SET version = version + 1 WHERE id = ?').run(cur.id);
+    return db.prepare('SELECT * FROM props WHERE id = ?').get(cur.id);
+  })();
+
+  res.json(serializeProp(prop));
+});
+
 /* ----------------------------- 排练场次接口 ----------------------------- */
 
 /** 服务端当前时间（UTC epoch 秒，整数）：计时一律以服务端时间为准，跨刷新/跨浏览器一致 */
